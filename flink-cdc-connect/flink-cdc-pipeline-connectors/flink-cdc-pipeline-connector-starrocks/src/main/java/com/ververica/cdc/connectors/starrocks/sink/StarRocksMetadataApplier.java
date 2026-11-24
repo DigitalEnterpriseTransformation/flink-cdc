@@ -20,6 +20,7 @@ import com.starrocks.connector.flink.catalog.StarRocksCatalog;
 import com.starrocks.connector.flink.catalog.StarRocksCatalogException;
 import com.starrocks.connector.flink.catalog.StarRocksColumn;
 import com.starrocks.connector.flink.catalog.StarRocksTable;
+import com.ververica.cdc.common.annotation.VisibleForTesting;
 import com.ververica.cdc.common.event.AddColumnEvent;
 import com.ververica.cdc.common.event.AlterColumnTypeEvent;
 import com.ververica.cdc.common.event.CreateTableEvent;
@@ -49,6 +50,7 @@ public class StarRocksMetadataApplier implements MetadataApplier {
     private final TableCreateConfig tableCreateConfig;
     private final SchemaChangeConfig schemaChangeConfig;
     private boolean isOpened;
+    private long alterJobPollIntervalMs = 2000L;
 
     public StarRocksMetadataApplier(
             StarRocksCatalog catalog,
@@ -124,15 +126,30 @@ public class StarRocksMetadataApplier implements MetadataApplier {
         }
 
         TableId tableId = addColumnEvent.tableId();
+
+        // An ADD COLUMN job issued before a failover may still be running in StarRocks: its
+        // columns are not visible yet, but re-issuing the ALTER fails with "Duplicate column".
+        // Wait for it to finish, then only add the columns that are still missing.
+        waitForUnfinishedColumnAlterJob(tableId);
+        List<StarRocksColumn> missingColumns = filterMissingColumns(tableId, addColumns);
+        if (missingColumns.isEmpty()) {
+            LOG.info(
+                    "All columns already exist in StarRocks, skip add column, event: {}",
+                    addColumnEvent);
+            return;
+        }
+
         StarRocksCatalogException alterException = null;
         try {
             catalog.alterAddColumns(
                     tableId.getSchemaName(),
                     tableId.getTableName(),
-                    addColumns,
+                    missingColumns,
                     schemaChangeConfig.getTimeoutSecond());
         } catch (StarRocksCatalogException e) {
             alterException = e;
+            // The ALTER may have timed out on client side while the job keeps running.
+            waitForUnfinishedColumnAlterJob(tableId);
         }
 
         // Check whether the columns have been actually added to the table.
@@ -184,6 +201,79 @@ public class StarRocksMetadataApplier implements MetadataApplier {
             LOG.error(errorMsg);
             throw new RuntimeException(errorMsg);
         }
+    }
+
+    /** Returns the columns that do not exist in the StarRocks table yet. */
+    private List<StarRocksColumn> filterMissingColumns(
+            TableId tableId, List<StarRocksColumn> columns) {
+        StarRocksTable table;
+        try {
+            table = catalog.getTable(tableId.getSchemaName(), tableId.getTableName()).orElse(null);
+        } catch (StarRocksCatalogException e) {
+            LOG.warn("Failed to get table {}, will try to add all columns", tableId, e);
+            return columns;
+        }
+        if (table == null) {
+            return columns;
+        }
+        List<StarRocksColumn> missing = new ArrayList<>();
+        for (StarRocksColumn column : columns) {
+            if (table.getColumn(column.getColumnName()) == null) {
+                missing.add(column);
+            } else {
+                LOG.info(
+                        "Column {} already exists in StarRocks table {}, skip adding it",
+                        column.getColumnName(),
+                        tableId);
+            }
+        }
+        return missing;
+    }
+
+    /**
+     * Blocks until the latest column schema change job of the table is finished or cancelled, or
+     * until {@code table.schema-change.timeout} elapses. Failures to query the job state are only
+     * logged, as this is a best-effort guard.
+     */
+    private void waitForUnfinishedColumnAlterJob(TableId tableId) {
+        if (!(catalog instanceof StarRocksEnrichedCatalog)) {
+            return;
+        }
+        StarRocksEnrichedCatalog enrichedCatalog = (StarRocksEnrichedCatalog) catalog;
+        long deadline = System.currentTimeMillis() + schemaChangeConfig.getTimeoutSecond() * 1000L;
+        boolean logged = false;
+        try {
+            while (enrichedCatalog.hasUnfinishedColumnAlterJob(
+                    tableId.getSchemaName(), tableId.getTableName())) {
+                if (!logged) {
+                    LOG.info(
+                            "Waiting for the unfinished column schema change job of StarRocks table {}",
+                            tableId);
+                    logged = true;
+                }
+                if (System.currentTimeMillis() >= deadline) {
+                    LOG.warn(
+                            "Column schema change job of StarRocks table {} is still unfinished after {}s",
+                            tableId,
+                            schemaChangeConfig.getTimeoutSecond());
+                    return;
+                }
+                Thread.sleep(alterJobPollIntervalMs);
+            }
+            if (logged) {
+                LOG.info("Column schema change job of StarRocks table {} finished", tableId);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            LOG.warn("Failed to check column schema change job of table {}", tableId, e);
+        }
+    }
+
+    /** Sets the interval of polling the state of StarRocks schema change jobs. */
+    @VisibleForTesting
+    public void setAlterJobPollIntervalMs(long alterJobPollIntervalMs) {
+        this.alterJobPollIntervalMs = alterJobPollIntervalMs;
     }
 
     private void applyDropColumn(DropColumnEvent dropColumnEvent) {

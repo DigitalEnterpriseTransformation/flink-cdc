@@ -70,7 +70,7 @@ public class StarRocksDataSink implements DataSink, Serializable {
     @Override
     public MetadataApplier getMetadataApplier() {
         StarRocksCatalog catalog =
-                new StarRocksCatalog(
+                new StarRocksEnrichedCatalog(
                         sinkOptions.getJdbcUrl(),
                         sinkOptions.getUsername(),
                         sinkOptions.getPassword());

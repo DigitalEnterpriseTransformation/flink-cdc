@@ -187,6 +187,89 @@ public class StarRocksMetadataApplierTest {
     }
 
     @Test
+    public void testAddColumnIsIdempotentAfterFailover() throws Exception {
+        TableId tableId = TableId.parse("test.tbl_replay");
+        metadataApplier.applySchemaChange(
+                new CreateTableEvent(
+                        tableId,
+                        Schema.newBuilder()
+                                .physicalColumn("col1", new IntType())
+                                .primaryKey("col1")
+                                .build()));
+        AddColumnEvent addCol2 =
+                new AddColumnEvent(
+                        tableId,
+                        Collections.singletonList(
+                                new AddColumnEvent.ColumnWithPosition(
+                                        Column.physicalColumn("col2", new IntType()))));
+        metadataApplier.applySchemaChange(addCol2);
+
+        // Replayed after failover: col2 already exists, so no ALTER should be issued.
+        metadataApplier.applySchemaChange(addCol2);
+        assertEquals(1, catalog.alterAddColumnsCalls);
+
+        // Partially applied: only the missing col3 is added.
+        metadataApplier.applySchemaChange(
+                new AddColumnEvent(
+                        tableId,
+                        Arrays.asList(
+                                new AddColumnEvent.ColumnWithPosition(
+                                        Column.physicalColumn("col2", new IntType())),
+                                new AddColumnEvent.ColumnWithPosition(
+                                        Column.physicalColumn("col3", new IntType())))));
+        assertEquals(2, catalog.alterAddColumnsCalls);
+        assertEquals(Arrays.asList("col1", "col2", "col3"), columnNames(catalog, tableId));
+    }
+
+    @Test
+    public void testAddColumnWaitsForRunningAlterJob() throws Exception {
+        TableId tableId = TableId.parse("test.tbl_running");
+        metadataApplier.applySchemaChange(
+                new CreateTableEvent(
+                        tableId,
+                        Schema.newBuilder()
+                                .physicalColumn("col1", new IntType())
+                                .primaryKey("col1")
+                                .build()));
+
+        // An ADD COLUMN job submitted before failover is still running: col2 is not visible yet
+        // and adding it again would fail with "Duplicate column".
+        catalog.simulateRunningAddColumnJob(
+                tableId.getSchemaName(),
+                tableId.getTableName(),
+                Collections.singletonList(
+                        new StarRocksColumn.Builder()
+                                .setColumnName("col2")
+                                .setOrdinalPosition(-1)
+                                .setDataType("int")
+                                .setNullable(true)
+                                .build()),
+                3);
+        metadataApplier.setAlterJobPollIntervalMs(1);
+
+        metadataApplier.applySchemaChange(
+                new AddColumnEvent(
+                        tableId,
+                        Collections.singletonList(
+                                new AddColumnEvent.ColumnWithPosition(
+                                        Column.physicalColumn("col2", new IntType())))));
+
+        assertEquals(0, catalog.alterAddColumnsCalls);
+        assertEquals(Arrays.asList("col1", "col2"), columnNames(catalog, tableId));
+    }
+
+    private static List<String> columnNames(MockStarRocksCatalog catalog, TableId tableId) {
+        StarRocksTable table =
+                catalog.getTable(tableId.getSchemaName(), tableId.getTableName()).orElse(null);
+        assertNotNull(table);
+        List<String> names = new ArrayList<>();
+        for (StarRocksColumn column : table.getColumns()) {
+            names.add(column.getColumnName());
+        }
+        return names;
+    }
+
+    @Test
     public void testDropColumn() throws Exception {
         TableId tableId = TableId.parse("test.tbl3");
         Schema schema =

@@ -20,6 +20,7 @@ import com.starrocks.connector.flink.catalog.StarRocksCatalog;
 import com.starrocks.connector.flink.catalog.StarRocksCatalogException;
 import com.starrocks.connector.flink.catalog.StarRocksColumn;
 import com.starrocks.connector.flink.catalog.StarRocksTable;
+import com.ververica.cdc.connectors.starrocks.sink.StarRocksEnrichedCatalog;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -28,10 +29,20 @@ import java.util.Map;
 import java.util.Optional;
 
 /** Mock {@link StarRocksCatalog} for testing. */
-public class MockStarRocksCatalog extends StarRocksCatalog {
+public class MockStarRocksCatalog extends StarRocksEnrichedCatalog {
 
     /** database name -> table name -> table. */
     private final Map<String, Map<String, StarRocksTable>> tables;
+
+    /** Number of times {@link #alterAddColumns} has been called. */
+    int alterAddColumnsCalls = 0;
+
+    /** Simulated in-flight ADD COLUMN job: remaining polls before it finishes, and its columns. */
+    private int runningJobRemainingPolls = 0;
+
+    private String runningJobDatabase;
+    private String runningJobTable;
+    private List<StarRocksColumn> runningJobColumns;
 
     public MockStarRocksCatalog() {
         super("jdbc:mysql://127.0.0.1:9030", "root", "");
@@ -95,12 +106,64 @@ public class MockStarRocksCatalog extends StarRocksCatalog {
         }
     }
 
+    /**
+     * Simulates an ADD COLUMN job that was submitted earlier (e.g. before a failover) and is still
+     * running: the columns become visible after {@code polls} calls of {@link
+     * #hasUnfinishedColumnAlterJob}, and adding them again meanwhile fails with "Duplicate column".
+     */
+    void simulateRunningAddColumnJob(
+            String databaseName, String tableName, List<StarRocksColumn> columns, int polls) {
+        this.runningJobDatabase = databaseName;
+        this.runningJobTable = tableName;
+        this.runningJobColumns = columns;
+        this.runningJobRemainingPolls = polls;
+    }
+
+    @Override
+    public boolean hasUnfinishedColumnAlterJob(String databaseName, String tableName)
+            throws StarRocksCatalogException {
+        if (runningJobRemainingPolls <= 0
+                || !databaseName.equals(runningJobDatabase)
+                || !tableName.equals(runningJobTable)) {
+            return false;
+        }
+        runningJobRemainingPolls--;
+        if (runningJobRemainingPolls == 0) {
+            doAddColumns(databaseName, tableName, runningJobColumns);
+            return false;
+        }
+        return true;
+    }
+
     @Override
     public void alterAddColumns(
             String databaseName,
             String tableName,
             List<StarRocksColumn> addColumns,
             long timeoutSecond)
+            throws StarRocksCatalogException {
+        alterAddColumnsCalls++;
+        for (StarRocksColumn column : addColumns) {
+            boolean pending =
+                    runningJobRemainingPolls > 0
+                            && databaseName.equals(runningJobDatabase)
+                            && tableName.equals(runningJobTable)
+                            && runningJobColumns.stream()
+                                    .anyMatch(
+                                            c -> c.getColumnName().equals(column.getColumnName()));
+            Optional<StarRocksTable> table = getTable(databaseName, tableName);
+            if (pending
+                    || (table.isPresent()
+                            && table.get().getColumn(column.getColumnName()) != null)) {
+                throw new StarRocksCatalogException(
+                        "Duplicate column name '" + column.getColumnName() + "'");
+            }
+        }
+        doAddColumns(databaseName, tableName, addColumns);
+    }
+
+    private void doAddColumns(
+            String databaseName, String tableName, List<StarRocksColumn> addColumns)
             throws StarRocksCatalogException {
         Map<String, StarRocksTable> dbTables = tables.get(databaseName);
         if (dbTables == null) {
